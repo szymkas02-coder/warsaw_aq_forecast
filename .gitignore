@@ -2,9 +2,9 @@
 data/raw/
 data/processed/
 
-# Heavy outputs — ignore models and figures at any depth, keep results CSVs
-**/models/
-**/figures/
+# Heavy outputs — ignore models and figures under outputs/, keep results CSVs
+outputs/**/models/
+outputs/**/figures/
 
 # Python
 __pycache__/
