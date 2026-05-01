@@ -9,7 +9,6 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import numpy as np
 import pandas as pd
-import seaborn as sns
 
 from .config import WHO_24H_PM25, FIGURES_DIR
 from .utils import setup_logging, ensure_dirs
@@ -291,12 +290,13 @@ def shap_analysis(
     sample = X_test.iloc[:2000] if len(X_test) > 2000 else X_test
     shap_values = explainer.shap_values(sample)
 
-    # Summary plot
-    fig_summary, ax = plt.subplots(figsize=(10, 6))
+    # Summary plot — shap.summary_plot creates its own figure internally,
+    # so we capture it via plt.gcf() after the call rather than using a pre-created figure.
     shap.summary_plot(shap_values, sample, feature_names=feature_names,
-                      show=False, plot_size=None)
+                      show=False, plot_size=(10, 6))
     plt.title(f"SHAP Feature Importance {title_suffix}")
     plt.tight_layout()
+    fig_summary = plt.gcf()
     fig_summary.savefig(save_dir / f"shap_summary_{title_suffix}.png", bbox_inches="tight")
     plt.close(fig_summary)
 

@@ -12,7 +12,7 @@ from sklearn.model_selection import TimeSeriesSplit
 
 from ..config import (
     STATION_COORDS, TARGET, NEIGHBOR_STATIONS,
-    CV_SPLITS, RANDOM_SEED, MODEL_DIR, HORIZONS,
+    CV_SPLITS, RANDOM_SEED, MODEL_DIR,
 )
 from ..utils import setup_logging, ensure_dirs
 
@@ -119,6 +119,12 @@ def dynamic_adjacency(
         y = np.cos(lat1) * np.sin(lat2) - np.sin(lat1) * np.cos(lat2) * np.cos(dlon)
         return (np.degrees(np.arctan2(x, y)) + 360) % 360
 
+    # TODO: dyn[i, j] currently depends only on j (the source node), not i (the
+    # receiver). All rows of the dynamic matrix are therefore identical after
+    # row-normalisation. The intended behaviour is that each node weights its
+    # neighbours differently based on wind direction, but the correct bearing
+    # should be bearing(coords[j], coords[i]) — from neighbour j toward receiver i.
+    # Currently dormant because notebooks use A_static throughout.
     dyn = np.zeros((n, n), dtype=np.float32)
     for i in range(n):
         for j in range(n):
@@ -558,6 +564,9 @@ def train_stacking_ensemble(
     X_arr = X_train.values
     y_arr = y_train.values
     oof_matrix = np.zeros((len(X_train), n_base), dtype=np.float32)
+    # Track which rows actually received OOF predictions (TimeSeriesSplit skips the
+    # first fold's training rows — they are never a validation set)
+    oof_filled = np.zeros((len(X_train), n_base), dtype=bool)
 
     for m_idx, (name, factory) in enumerate(base_models.items()):
         log.info("OOF [%d/%d]: fitting base model '%s' across %d folds",
@@ -567,23 +576,32 @@ def train_stacking_ensemble(
             fold_model = factory()
             fold_model.fit(X_arr[tr_idx], y_arr[tr_idx])
             oof_matrix[val_idx, m_idx] = fold_model.predict(X_arr[val_idx])
+            oof_filled[val_idx, m_idx] = True
             log.info("  fold %d/%d — train=%d val=%d", fold + 1, n_splits,
                      len(tr_idx), len(val_idx))
 
     if gnn_oof_preds is not None:
         assert len(gnn_oof_preds) == len(X_train), "GNN OOF length mismatch"
         oof_matrix[:, -1] = gnn_oof_preds.astype(np.float32)
-        log.info("Added GNN-LSTM OOF predictions as base model column %d", n_base - 1)
+        oof_filled[:, -1] = True
+        # NOTE: gnn_oof_preds are full-train predictions (GNN trained on all training
+        # data), not true out-of-fold predictions. Generating true GNN OOF would
+        # require 5× retraining which is prohibitively expensive. The meta-learner
+        # may therefore slightly over-weight the GNN column; test-set metrics are
+        # unaffected since test data was never seen during GNN training.
+        log.warning("GNN column uses full-train predictions, not true OOF — "
+                    "meta-learner may slightly over-weight GNN.")
+        log.info("Added GNN-LSTM predictions as base model column %d", n_base - 1)
 
     # Report OOF MAE per base model as a sanity check
     from sklearn.metrics import mean_absolute_error
     model_names = list(base_models.keys()) + (["gnn_lstm"] if gnn_oof_preds is not None else [])
     for mi, mname in enumerate(model_names):
-        # Only evaluate rows where OOF predictions were filled (first fold is always empty at start)
-        filled = oof_matrix[:, mi] != 0
+        filled = oof_filled[:, mi]
         if filled.sum() > 0:
             oof_mae = mean_absolute_error(y_arr[filled], oof_matrix[filled, mi])
-            log.info("  OOF MAE [%s] = %.4f  (on %d rows)", mname, oof_mae, filled.sum())
+            log.info("  OOF MAE [%s] = %.4f  (on %d/%d rows)",
+                     mname, oof_mae, filled.sum(), len(y_arr))
 
     # Meta features: OOF predictions + time/weather signals (no future leak)
     meta_X = np.hstack([oof_matrix, X_train[meta_feature_cols].values.astype(np.float32)])

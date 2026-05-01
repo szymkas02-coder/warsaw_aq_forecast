@@ -7,7 +7,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 
-from ..config import MODEL_DIR, RANDOM_SEED, HORIZONS
+from ..config import MODEL_DIR, RANDOM_SEED
 from ..utils import setup_logging, ensure_dirs
 
 log = setup_logging(__name__)

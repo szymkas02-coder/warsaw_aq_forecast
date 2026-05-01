@@ -33,8 +33,8 @@ warsaw_aq_forecast/
 │   ├── raw/FINAL_merged_PM25_1g_all_seasons.csv   ← 52 608 hourly rows, 27 cols
 │   └── processed/                                  ← reserved for derived artefacts
 ├── notebooks/
-│   ├── MS_00_EDA.ipynb                    ← exploratory analysis, cross-station EDA
-│   ├── MS_00b_cross_station_EDA.ipynb     ← spatial correlation analysis
+│   ├── MS_00_EDA.ipynb                    ← per-station EDA, naive baseline
+│   ├── MS_00b_cross_station_EDA.ipynb     ← cross-station spatial correlation analysis
 │   ├── MS_C1_xgboost.ipynb                ← Architecture C1: XGBoost/HGB (final)
 │   ├── MS_C2_cnn_lstm.ipynb               ← Architecture C2: CNN-LSTM (final)
 │   ├── MS_C3_gnn_stacking.ipynb           ← Architecture C3: GNN-LSTM + Stacking (final)
@@ -56,8 +56,8 @@ warsaw_aq_forecast/
 │   ├── figures/                     ← all saved plots (.png, .html)
 │   └── results/                     ← metrics CSVs, comparison_table_all.csv
 ├── ARCHITECTURE.md                  ← this file
-├── README.md                        ← full project overview and literature review
-├── README_github.md                 ← concise GitHub-facing README
+├── README.md                        ← concise GitHub-facing README
+├── README_long.md                   ← full project overview and literature review
 ├── requirements.txt
 └── environment.yml
 ```

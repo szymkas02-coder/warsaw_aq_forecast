@@ -59,7 +59,6 @@ ALERT_THRESHOLD = 50  # µg/m³ — Polish alert level
 
 # ── Model / training ──────────────────────────────────────────────────
 RANDOM_SEED = 42
-SEQ_LEN_GBM = 48    # lookback window for lag features
 SEQ_LEN_LSTM = 48   # sequence length for CNN-LSTM / GNN
 N_OPTUNA_TRIALS = 50
 CV_SPLITS = 5
