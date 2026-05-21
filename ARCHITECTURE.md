@@ -57,7 +57,8 @@ warsaw_aq_forecast/
 │   └── results/                     ← metrics CSVs, comparison_table_all.csv
 ├── ARCHITECTURE.md                  ← this file
 ├── README.md                        ← concise GitHub-facing README
-├── README_long.md                   ← full project overview and literature review
+├── docs/
+│   └── README_long.md               ← full project overview and literature review
 ├── requirements.txt
 └── environment.yml
 ```
@@ -172,6 +173,7 @@ DEW_POINT, RAIN_6H, SUNSHINE, blh) can be used in two ways, controlled by
 |---|---|---|
 | `"current"` (default) | Weather measured at t | Weather when forecast is issued |
 | `"perfect_forecast"` | Weather measured at t+h | Perfect NWP forecast for the predicted moment |
+| `"perfect_forecast_full"` | Met + HYSPLIT both shifted to t+h | Used in final MS_ notebooks; maximum information upper bound |
 
 ```python
 # Default — weather at t
@@ -524,14 +526,16 @@ root to `sys.path` with `sys.path.insert(0, '..')` at the top of each notebook.
 
 | Notebook | Reads | Writes |
 |---|---|---|
-| `MS_00_EDA.ipynb` | raw CSV | `outputs/figures/`, `outputs/results/naive_baseline.csv` |
-| `MS_00b_cross_station_EDA.ipynb` | raw CSV | `outputs/figures/` (spatial correlation plots) |
-| `MS_C1_xgboost.ipynb` | raw CSV | `outputs/models/xgb_pfx_h*.pkl`, `hgb_pfx_h*.pkl`, `C1_metrics.csv` |
-| `MS_C2_cnn_lstm.ipynb` | raw CSV | `outputs/models/cnn_lstm_pfx_model.pt`, `C2_metrics.csv` |
-| `MS_C3_gnn_stacking.ipynb` | raw CSV + C1 models | `gnn_lstm_pfx_model.pt`, `meta_learner_pfx_h*.pkl`, `C3_metrics.csv`, `comparison_table_all.csv` |
-| `MS_04_comparison.ipynb` | `comparison_table_all.csv` | comparison figures |
-| `MS_05_shap.ipynb` | C1 models | SHAP summary and dependence plots |
-| `MS_06_smog_episodes.ipynb` | C1 + C3 models, raw CSV | episode overlay figures |
+| `MS_00_EDA.ipynb` | raw CSV | `outputs/{station}/figures/` (gitignored), `outputs/results/naive_baseline.csv` |
+| `MS_00b_cross_station_EDA.ipynb` | raw CSV | `outputs/{station}/figures/` (gitignored) |
+| `MS_C1_xgboost.ipynb` | raw CSV | `outputs/{station}/models/xgb_pfxf_h*.pkl`, `hgb_pfxf_h*.pkl` (gitignored), `C1_metrics.csv` |
+| `MS_C2_cnn_lstm.ipynb` | raw CSV | `outputs/{station}/models/cnn_lstm_pfxf_model.pt` (gitignored), `C2_metrics.csv` |
+| `MS_C3_gnn_stacking.ipynb` | raw CSV + C1 models | `gnn_lstm_pfxf_model.pt`, `meta_learner_pfxf_h*.pkl` (gitignored), `C3_metrics.csv`, `comparison_table_all.csv` |
+| `MS_04_comparison.ipynb` | `C1/C2/C3_metrics.csv` per station | cross-station comparison figures (gitignored) |
+| `MS_05_shap.ipynb` | C1 models | SHAP summary and dependence plots (gitignored) |
+| `MS_06_smog_episodes.ipynb` | C1 + C3 models, raw CSV | episode overlay figures (gitignored) |
+
+> **Note:** `outputs/**/figures/` and `outputs/**/models/` are gitignored — figures and model weights are not tracked in the repository. Only results CSVs under `outputs/**/results/` are committed.
 
 ---
 

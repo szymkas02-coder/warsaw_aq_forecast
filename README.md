@@ -3,7 +3,7 @@
 **Multi-architecture ML system for 1–24 hour PM2.5 forecasting in Warsaw, Poland**
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
-[![License: CC BY 4.0](https://img.shields.io/badge/License-CC%20BY%204.0-lightgrey.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ---
 
@@ -115,7 +115,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for a complete module-level code guide.
 
 Key references: Czernecki et al. (2021) — Polish AQ benchmarks; Liao et al. (2023) DM-STGNN — HYSPLIT-aware GNN; Tian et al. (2024) — stacking for PM2.5; Qi et al. (2019) GC-LSTM.
 
-Full bibliography in [README_long.md](README_long.md#11-references).
+Full bibliography in [docs/README_long.md](docs/README_long.md#11-references).
 
 ---
 
@@ -124,3 +124,9 @@ Full bibliography in [README_long.md](README_long.md#11-references).
 PM2.5 data: GIOŚ Poland | Meteorology: IMGW-PIB | ERA5: Copernicus/ECMWF | HYSPLIT: NOAA ARL
 
 *Research project on ML applications for urban air quality management in Warsaw.*
+
+---
+
+## License
+
+Code: [MIT License](LICENSE) | Documentation, results, and figures: [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)

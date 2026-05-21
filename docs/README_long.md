@@ -3,8 +3,9 @@
 **Multi-architecture machine learning system for 24-hour PM2.5 air quality forecasting in the Warsaw Metropolitan Area**
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](../LICENSE)
+
+> **Note on the literature review:** Section 10 was compiled with the assistance of AI-powered literature search tools — Consensus, Elicit, and Google Deep Research — and manually verified against primary sources.
 
 ---
 
@@ -154,24 +155,9 @@ The meteorological columns support two operating modes, controlled by the `weath
 |---|---|---|
 | `"current"` (default) | Weather measured at **t** | Baseline — weather at forecast-issuance time |
 | `"perfect_forecast"` | Weather measured at **t+h** | Simulates a perfect NWP forecast for the predicted moment |
+| `"perfect_forecast_full"` | Met + HYSPLIT both shifted to **t+h** | Used in final MS_ notebooks; maximum information upper bound |
 
-The `"perfect_forecast"` mode is the **standard setup in the academic literature** (Liao et al., 2023; Qi et al., 2019). For a 24-hour horizon, NWP models (ECMWF, GFS) produce near-perfect synoptic-scale forecasts of BLH, temperature and pressure — the assumption is defensible. This mode provides the model with richer information and is expected to improve skill significantly at h > 6.
-
-```python
-from src.feature_engineering import build_feature_matrix
-
-# Default — weather at t
-X, y = build_feature_matrix(train_df, horizon=24)
-
-# Literature-standard — weather at t+24 (NWP perfect forecast)
-X, y = build_feature_matrix(train_df, horizon=24, weather_mode="perfect_forecast")
-
-# Same flag works for sequence datasets (CNN-LSTM, GNN)
-from src.feature_engineering import build_sequence_dataset
-X_seq, y_seq, feat_names, scaler = build_sequence_dataset(
-    train_df, seq_len=48, fit_scaler=True, weather_mode="perfect_forecast"
-)
-```
+The `"perfect_forecast"` / `"perfect_forecast_full"` modes are the **standard setup in the academic literature** (Liao et al., 2023; Qi et al., 2019). For a 24-hour horizon, NWP models (ECMWF, GFS) produce near-perfect synoptic-scale forecasts of BLH, temperature and pressure — the assumption is defensible. This mode provides the model with richer information and is expected to improve skill significantly at h > 6.
 
 This is **not data leakage**: the shifted met values simulate NWP model output, not observed future PM2.5. Future PM2.5 is never used as a feature — only as the prediction target.
 
@@ -207,9 +193,10 @@ Special attention is given to the model's behavior during acute smog episodes (P
 
 ```
 warsaw_aq_forecast/
-├── README.md
-├── README_github.md                   # Concise GitHub-facing README
+├── README.md                          # Concise GitHub-facing README
 ├── ARCHITECTURE.md                    # Full module-level code guide
+├── docs/
+│   └── README_long.md                 # This file — full overview and literature review
 ├── data/
 │   ├── raw/                           # FINAL_merged_PM25_1g_all_seasons.csv
 │   └── processed/                     # Auto-generated features
@@ -233,8 +220,8 @@ warsaw_aq_forecast/
 │   │   └── gnn_stacking.py            # Architecture C3
 │   └── utils.py                       # Shared helpers
 ├── outputs/
-│   ├── models/                        # Saved model artifacts (.pkl, .pt)
-│   ├── figures/                       # Publication-quality plots
+│   ├── models/                        # Saved model artifacts (.pkl, .pt) — gitignored
+│   ├── figures/                       # Publication-quality plots — gitignored
 │   └── results/                       # Metrics CSVs, comparison_table_all.csv
 ├── requirements.txt
 └── environment.yml
@@ -247,11 +234,9 @@ warsaw_aq_forecast/
 ### Environment Setup
 
 ```bash
-# Clone the repository
 git clone https://github.com/youruser/warsaw_aq_forecast.git
 cd warsaw_aq_forecast
 
-# Create conda environment
 conda env create -f environment.yml
 conda activate warsaw_aq
 
@@ -278,15 +263,11 @@ MS_00_EDA → MS_00b_cross_station_EDA → MS_C1_xgboost → MS_C2_cnn_lstm
 
 `MS_C3` depends on trained C1 models (`.pkl` files in `outputs/models/`) being present. All other notebooks are self-contained.
 
-### Running from CLI
-
-The primary entry points are Jupyter notebooks. All `src/` modules can be imported directly for scripted use — refer to `ARCHITECTURE.md` for the full API.
-
 ---
 
 ## 9. Results
 
-All results are on the held-out 2024 test set (8 784 hourly observations). The final model series (C-series) uses `weather_mode="perfect_forecast"` — meteorological inputs are aligned to the predicted moment, simulating perfect NWP output. This is the standard literature setup; see Section 5 for details.
+All results are on the held-out 2024 test set (8 784 hourly observations). The final model series (C-series) uses `weather_mode="perfect_forecast_full"` — meteorological inputs are aligned to the predicted moment, simulating perfect NWP output. This is the standard literature setup; see Section 5 for details.
 
 | Model | h=1h MAE | h=6h MAE | h=12h MAE | h=24h MAE | h=24h R² |
 |---|---|---|---|---|---|
@@ -297,7 +278,7 @@ All results are on the held-out 2024 test set (8 784 hourly observations). The f
 | C3: GNN-LSTM (base) | 2.68 | 3.74 | 4.35 | 3.86 µg/m³ | 0.56 |
 | C3: Stacking (final) | 1.16 | 3.12 | 3.97 | **4.33 µg/m³** | **0.47** |
 
-> MAE in µg/m³. **Bold** = best per column. C3 Stacking matches C1 HGB at h=24 while outperforming all models at mid-range horizons (h=10–20) via the GNN-LSTM base model. C3 GNN-LSTM alone achieves the best R²=0.56 at h=24.
+> MAE in µg/m³. **Bold** = best per column. C3 GNN-LSTM alone achieves the best R²=0.56 at h=24.
 
 ### Smog episode skill
 
@@ -306,6 +287,8 @@ Top-5 worst PM2.5 episodes in 2024 were analysed separately (see `MS_06_smog_epi
 ---
 
 ## 10. Literature Review
+
+> The literature review below was compiled with the assistance of AI-powered search tools (Consensus, Elicit, Google Deep Research) and manually verified against primary sources.
 
 ### 10.1 Machine Learning for Air Quality Prediction: Overview
 
@@ -401,7 +384,7 @@ Yang, J., Yan, R., Nong, M., Liao, J., Li, F., & Sun, W. (2021). PM2.5 concentra
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for details.
+Code: MIT License. Documentation, results, and figures: CC BY 4.0. See [LICENSE](../LICENSE) for details.
 
 ## Acknowledgements
 
