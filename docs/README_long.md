@@ -39,13 +39,13 @@ This project develops and compares **three machine learning architectures** for 
 
 | Architecture | Algorithm | Horizon Strategy |
 |---|---|---|
-| **A1** | XGBoost / HistGradientBoosting | Direct multi-step (24 models) |
-| **A2** | CNN-LSTM (Bidirectional) | MIMO — one model, 24 outputs |
-| **A3** | GNN-LSTM + LightGBM meta-learner | Stacking ensemble |
+| **C1** | XGBoost / HistGradientBoosting | Direct multi-step (24 models) |
+| **C2** | CNN-LSTM (Bidirectional) | MIMO — one model, 24 outputs |
+| **C3** | GNN-LSTM + Stacking ensemble | OOF stacking meta-learner |
 
 All architectures use **physically meaningful inputs** — Okęcie synoptic meteorological observations, ERA5 Boundary Layer Height, and HYSPLIT 24/48-hour back-trajectory cluster directions — to ensure the model learns causally valid relationships rather than spurious correlations.
 
-> **Key results:** Architecture C3 (GNN-LSTM + Stacking, perfect-forecast weather) achieves the lowest MAE at all horizons h≥4, with h=24 MAE=4.33 µg/m³ — a **20% reduction** vs. the persistence naive baseline (5.41 µg/m³). C1 (HGB) dominates at h≤3 with MAE=1.13 µg/m³ at h=1 and significantly lower inference cost.
+> **Key results:** C3 GNN-LSTM (base) achieves the best h=24 performance with MAE=3.86 µg/m³ and R²=0.56 — a **29% MAE reduction** vs. the persistence naive baseline (5.41 µg/m³). C3 Stacking matches C1 HGB at h=24 (MAE=4.33) while C1 HGB dominates at h≤3 with MAE=1.13 µg/m³ at h=1 and significantly lower inference cost.
 
 ---
 

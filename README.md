@@ -23,7 +23,7 @@ The models are trained on 2019–2023 hourly data (Okęcie synoptic observations
 | **C2** | Bidirectional CNN-LSTM | MIMO (one model, 24 outputs) | Huber loss, early stopping |
 | **C3** | GNN-LSTM + Stacking ensemble | OOF stacking meta-learner | Spatial graph over 7 stations |
 
-All models use `weather_mode="perfect_forecast"` — meteorological inputs aligned to the predicted moment, simulating NWP output. This is the standard setup in the academic literature.
+All models use `weather_mode="perfect_forecast_full"` — both meteorological inputs and HYSPLIT trajectory features aligned to the predicted moment, simulating NWP output. This is the standard setup in the academic literature.
 
 ---
 
