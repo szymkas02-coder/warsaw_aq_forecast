@@ -57,6 +57,8 @@ def build_cnn_lstm_model(
             self.lstm1 = nn.LSTM(128, 128, batch_first=True, bidirectional=True)
             self.drop2 = nn.Dropout(0.3)
             self.lstm2 = nn.LSTM(256, 64, batch_first=True, bidirectional=True)
+            # Additive attention over LSTM outputs (same design as GnnLstmModel)
+            self.attn_w = nn.Linear(128, 1)
             self.fc1 = nn.Linear(128, 64)
             self.fc2 = nn.Linear(64, n_horizons)
             self.relu = nn.ReLU()
@@ -70,8 +72,11 @@ def build_cnn_lstm_model(
             x = x.permute(0, 2, 1)          # → (batch, seq_len//2, 128)
             x, _ = self.lstm1(x)
             x = self.drop2(x)
-            x, _ = self.lstm2(x)
-            x = x[:, -1, :]                  # last timestep → (batch, 128)
+            x, _ = self.lstm2(x)             # → (batch, seq_len//2, 128)
+            # Attention over all timesteps instead of last-timestep-only
+            scores = self.attn_w(x)                      # (batch, seq_len//2, 1)
+            weights = torch.softmax(scores, dim=1)
+            x = (weights * x).sum(dim=1)                 # (batch, 128)
             x = self.relu(self.fc1(x))
             return self.fc2(x)               # (batch, n_horizons)
 
