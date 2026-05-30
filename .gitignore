@@ -6,12 +6,18 @@ data/processed/
 outputs/**/models/
 outputs/**/figures/
 
+# Local backup of stale/legacy outputs (pre-rerun) — not for version control
+outputs/legacy/
+
 # Python
 __pycache__/
 *.py[cod]
 *.pyo
 .ipynb_checkpoints/
 .pytest_cache/
+
+# CatBoost training logs (auto-generated during fitting)
+catboost_info/
 
 # Environments
 .env
@@ -32,3 +38,5 @@ Thumbs.db
 # Local notes
 TODO_improvements.md
 RERUN_NEEDED.md
+MODEL_ANALYSIS.md
+LEARNINGS.md

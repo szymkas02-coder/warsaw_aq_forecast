@@ -11,14 +11,16 @@ import pandas as pd
 from sklearn.model_selection import TimeSeriesSplit
 
 from ..config import (
-    STATION_COORDS, TARGET, NEIGHBOR_STATIONS,
+    STATION_COORDS, TARGET, NEIGHBOR_STATIONS, ALL_STATIONS,
     CV_SPLITS, RANDOM_SEED, MODEL_DIR,
 )
 from ..utils import setup_logging, ensure_dirs
 
 log = setup_logging(__name__)
 
-ALL_STATIONS_ORDERED = [TARGET] + NEIGHBOR_STATIONS  # target is node 0
+# Single shared multi-output GNN: every station is a node AND a readout target,
+# so the node order is the fixed canonical station list (independent of TARGET).
+ALL_STATIONS_ORDERED = list(ALL_STATIONS)
 
 
 # ── Graph construction ────────────────────────────────────────────────
@@ -154,12 +156,13 @@ def build_gnn_lstm_model(
     gnn_hidden: int = 64,
     lstm_hidden: int = 128,
 ) -> "torch.nn.Module":
-    """Build a GNN-LSTM model with attention over LSTM outputs.
+    """Build a shared multi-output GNN-LSTM model with attention over LSTM outputs.
 
     At each timestep, a single-layer graph convolution aggregates spatial
-    information across all stations. The resulting target-node embeddings
-    are fed into a bidirectional LSTM, followed by a learned attention
-    mechanism, and a two-layer head predicting all 24 horizons at once.
+    information across all stations. **All** node embeddings (not just node 0) are
+    fed — with weights shared across nodes — into a bidirectional LSTM, a learned
+    attention mechanism, and a two-layer head, producing all 24 horizons for every
+    station node at once. Forecasts for a given station are read out from its node.
 
     Args:
         n_nodes: Number of stations (7).
@@ -170,7 +173,7 @@ def build_gnn_lstm_model(
         lstm_hidden: LSTM hidden size.
 
     Returns:
-        Initialised PyTorch nn.Module.
+        Initialised PyTorch nn.Module whose forward returns (batch, n_nodes, n_horizons).
 
     Example:
         >>> model = build_gnn_lstm_model(7, 10, 24)
@@ -212,26 +215,32 @@ def build_gnn_lstm_model(
         def forward(self, x, A):
             # x: (batch, seq_len, n_nodes, n_node_features)
             # A: (n_nodes, n_nodes)
-            batch, T, N, F = x.shape
-            # Apply graph conv at each timestep
+            batch, T, N, Fdim = x.shape
+            # Apply graph conv at each timestep, keeping ALL node embeddings.
             gnn_out = []
             for t in range(T):
                 xt = x[:, t, :, :]                             # (batch, n_nodes, n_features)
                 ht = self.graph_conv(xt, A)                    # (batch, n_nodes, gnn_hidden)
-                gnn_out.append(ht[:, 0, :])                    # select target node (idx 0)
-            target_seq = torch.stack(gnn_out, dim=1)           # (batch, seq_len, gnn_hidden)
+                gnn_out.append(ht)
+            # (batch, seq_len, n_nodes, gnn_hidden)
+            node_seq = torch.stack(gnn_out, dim=1)
+            # Fold nodes into the batch dim so the LSTM/attention/head weights are
+            # SHARED across all station nodes → one model emits every node's forecast.
+            H = node_seq.shape[-1]
+            node_seq = node_seq.permute(0, 2, 1, 3).reshape(batch * N, T, H)
 
-            # LSTM
-            lstm_out, _ = self.lstm(target_seq)                # (batch, seq_len, lstm_hidden*2)
+            # LSTM (shared)
+            lstm_out, _ = self.lstm(node_seq)                  # (batch*N, seq_len, lstm_hidden*2)
             lstm_out = self.drop(lstm_out)
 
-            # Attention
-            scores = self.attn_w(lstm_out)                     # (batch, seq_len, 1)
+            # Attention (shared)
+            scores = self.attn_w(lstm_out)                     # (batch*N, seq_len, 1)
             weights = torch.softmax(scores, dim=1)
-            context = (weights * lstm_out).sum(dim=1)          # (batch, lstm_hidden*2)
+            context = (weights * lstm_out).sum(dim=1)          # (batch*N, lstm_hidden*2)
 
             out = self.relu(self.fc1(context))
-            return self.fc2(out)                               # (batch, n_horizons)
+            out = self.fc2(out)                                # (batch*N, n_horizons)
+            return out.view(batch, N, -1)                      # (batch, n_nodes, n_horizons)
 
     return GnnLstmModel()
 
@@ -243,71 +252,110 @@ def build_gnn_sequence_dataset(
     seq_len: int = 24,
     horizons: Optional[List[int]] = None,
     weather_mode: str = "current",
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Build node-feature sequences and adjacency tensors for the GNN-LSTM.
+    scaler: Optional["StandardScaler"] = None,
+    fit_scaler: bool = False,
+    return_index: bool = False,
+):
+    """Build node-feature sequences and per-node targets for the shared GNN-LSTM.
 
-    Node features per timestep (10 per station):
-        pm25_lag_1, pm25_lag_24, TEMP, WIND_SPEED, blh, HUMIDITY,
-        hour_sin, hour_cos, month_sin, month_cos
+    Per-node features (per station, per timestep). Each node carries:
+        - station-specific: pm25_lag1, pm25_lag24, rolling_mean_24h, rolling_max_24h,
+          trend_24h  (computed from that station's own series)
+        - shared (broadcast to every node): all MET_COLS, HYSPLIT_NUMERIC,
+          HYSPLIT direction one-hots (dir_48_*, dir_24_*), hour_sin/cos, month_sin/cos
 
-    The shared meteorological node features (TEMP, WIND_SPEED, blh, HUMIDITY)
-    are affected by ``weather_mode``:
+    This matches the *information set* the tree models (C1, C3-stacking) receive via
+    ``build_feature_matrix`` — the GNN was previously given only hand-picked features
+    and no HYSPLIT direction dummies, which handicapped its long horizons. Neighbor-station
+    PM2.5 is deliberately NOT added as columns: the graph convolution already
+    aggregates it across nodes, so flat neighbor-lags would double-count.
 
-    ``"current"`` — met values at t (default).
-    ``"perfect_forecast"`` — met values shifted to t+max(horizons), simulating
-    a perfect NWP forecast for the furthest predicted moment.
+    Targets are **per node**: ``y`` has shape ``(n_samples, n_nodes, n_horizons)`` where
+    each node's target is that station's own future PM2.5. A single shared model is thus
+    trained once for all stations; forecasts for station *k* are read out from node *k*.
+
+    Features are StandardScaled (fit on train, reused on test) — like ``build_sequence_dataset``
+    for the CNN-LSTM. Without scaling, the graph convolution mixes raw-scale values
+    (blh ~1000s, pm25 ~10s, hour_sin ~1) through the same linear layer, which is
+    badly conditioned and degrades the weak-feature-dependent long horizons.
+
+    The shared met/HYSPLIT columns honour ``weather_mode`` (shifted to t+max(horizons)
+    for the perfect_forecast modes), identical to the tabular pipeline.
 
     Args:
         df: Raw DataFrame with DatetimeIndex.
         seq_len: Number of past timesteps.
         horizons: Output horizons (default 1..24).
-        weather_mode: ``"current"`` or ``"perfect_forecast"``.
+        weather_mode: ``"current"``, ``"perfect_forecast"`` or ``"perfect_forecast_full"``.
+        scaler: Pre-fitted StandardScaler (pass the one returned from the train call).
+        fit_scaler: If True, fit a new scaler on this data (use on the train split only).
 
     Returns:
         Tuple of:
             X: np.ndarray (n_samples, seq_len, n_nodes, n_node_features) float32
-            y: np.ndarray (n_samples, n_horizons) log1p-transformed float32
+            y: np.ndarray (n_samples, n_nodes, n_horizons) log1p-transformed float32
             A_static: np.ndarray (n_nodes, n_nodes) static adjacency float32
+            scaler: the fitted StandardScaler (or the one passed in)
 
     Example:
-        >>> X, y, A = build_gnn_sequence_dataset(train_df)
-        >>> X, y, A = build_gnn_sequence_dataset(train_df, weather_mode="perfect_forecast")
+        >>> X_tr, y_tr, A, sc = build_gnn_sequence_dataset(train_df, fit_scaler=True)
+        >>> X_te, y_te, _, _  = build_gnn_sequence_dataset(test_df, scaler=sc)
     """
     if horizons is None:
         horizons = HORIZONS
 
-    from ..feature_engineering import add_cyclical_time, add_weather_features
+    from ..feature_engineering import add_cyclical_time, add_weather_features, encode_hysplit
+    from ..config import MET_COLS, HYSPLIT_NUMERIC
+    from sklearn.preprocessing import StandardScaler
 
     df = add_cyclical_time(df)
-    # Apply weather mode to the shared met columns before building node features
+    # Apply weather mode to the shared met (and HYSPLIT, for _full) columns before
+    # building node features — identical to the tabular pipeline.
     pfx_horizon = max(horizons) if weather_mode in ("perfect_forecast", "perfect_forecast_full") else None
     df = add_weather_features(df, horizon=pfx_horizon, mode=weather_mode)
-    log.info("build_gnn_sequence_dataset | seq_len=%d | weather_mode=%s", seq_len, weather_mode)
+    df = encode_hysplit(df)  # creates dir_48_*/dir_24_* one-hots; keeps HYSPLIT numeric
+    log.info("build_gnn_sequence_dataset | seq_len=%d | weather_mode=%s | fit_scaler=%s",
+             seq_len, weather_mode, fit_scaler)
 
     stations = ALL_STATIONS_ORDERED
 
-    node_feat_cols = ["TEMP", "WIND_SPEED", "blh", "HUMIDITY",
-                      "hour_sin", "hour_cos", "month_sin", "month_cos"]
+    # HYSPLIT direction one-hot dummies produced by encode_hysplit (dir_48_*, dir_24_*).
+    # Included so the GNN's information set matches the tree/stacking models.
+    dir_dummy_cols = [c for c in df.columns
+                      if c.startswith("dir_48_") or c.startswith("dir_24_")]
+    # Shared features broadcast to every node — the same exogenous information the tree
+    # models receive via build_feature_matrix (all met, HYSPLIT numeric + dir dummies,
+    # cyclical time).
+    shared_cols = (list(MET_COLS)
+                   + [c for c in HYSPLIT_NUMERIC if c in df.columns]
+                   + dir_dummy_cols
+                   + ["hour_sin", "hour_cos", "month_sin", "month_cos"])
+    # Station-specific autoregressive features, computed from each node's own series.
+    station_specific = ["pm25_lag1", "pm25_lag24",
+                        "rolling_mean_24h", "rolling_max_24h", "trend_24h"]
 
-    # Build per-node feature matrix: [pm25_lag1, pm25_lag24] + shared met
     station_features = {}
     for s in stations:
         if s not in df.columns:
             log.warning("Station %s missing from df — filling with zeros", s)
             df[s] = 0.0
+        ser = df[s]
+        rolled = ser.shift(1).rolling(window=24, min_periods=12)
         feats = pd.DataFrame(index=df.index)
-        feats["pm25_lag1"] = df[s].shift(1)
-        feats["pm25_lag24"] = df[s].shift(24)
-        for c in node_feat_cols:
-            if c in df.columns:
-                feats[c] = df[c].values
-            else:
-                feats[c] = 0.0
-        station_features[s] = feats  # shape (T, 10)
+        feats["pm25_lag1"] = ser.shift(1)
+        feats["pm25_lag24"] = ser.shift(24)
+        feats["rolling_mean_24h"] = rolled.mean()
+        feats["rolling_max_24h"] = rolled.max()
+        feats["trend_24h"] = ser - ser.shift(24)
+        for c in shared_cols:
+            feats[c] = df[c].values if c in df.columns else 0.0
+        station_features[s] = feats
 
-    # Target: log1p of future PM2.5 at target station
+    # Per-node targets: log1p of each station's own future PM2.5. Columns are
+    # named "{station}_h{h}" so they stay distinct through the concat/dropna.
     target_matrix = pd.DataFrame(
-        {f"h{h}": df[TARGET].shift(-h) for h in horizons}, index=df.index
+        {f"{s}_h{h}": df[s].shift(-h) for s in stations for h in horizons},
+        index=df.index,
     )
 
     # Align: drop any row with NaN in any station feature or any target
@@ -316,18 +364,30 @@ def build_gnn_sequence_dataset(
     n = len(combined)
     assert n > seq_len, "Not enough clean rows for GNN sequences"
 
-    # Rebuild from combined index
-    n_node_features = 2 + len(node_feat_cols)  # pm25_lag1 + pm25_lag24 + 8 met
+    cols_per_node = station_specific + shared_cols
+    n_node_features = len(cols_per_node)
     n_nodes = len(stations)
     n_horizons = len(horizons)
 
     feat_arrays = np.zeros((n, n_nodes, n_node_features), dtype=np.float32)
-    cols_per_node = ["pm25_lag1", "pm25_lag24"] + node_feat_cols
     for ni, s in enumerate(stations):
         sub = station_features[s].loc[combined.index]
         feat_arrays[:, ni, :] = sub[cols_per_node].values.astype(np.float32)
 
-    y_all = np.log1p(combined[[f"h{h}" for h in horizons]].values.astype(np.float32))
+    # StandardScale per feature column (shared across nodes/timesteps). Fit on train
+    # only, reuse on test — mirrors build_sequence_dataset for the CNN-LSTM.
+    flat = feat_arrays.reshape(-1, n_node_features)
+    if fit_scaler:
+        scaler = StandardScaler()
+        flat = scaler.fit_transform(flat)
+    elif scaler is not None:
+        flat = scaler.transform(flat)
+    feat_arrays = flat.reshape(n, n_nodes, n_node_features).astype(np.float32)
+
+    # Per-node target tensor: (n, n_nodes, n_horizons), log1p-transformed.
+    y_cols = [f"{s}_h{h}" for s in stations for h in horizons]
+    y_all = np.log1p(combined[y_cols].values.astype(np.float32))
+    y_all = y_all.reshape(n, n_nodes, n_horizons)
 
     # Sliding window
     n_samples = n - seq_len + 1
@@ -335,11 +395,21 @@ def build_gnn_sequence_dataset(
     y = y_all[seq_len - 1:]
 
     assert X.shape == (n_samples, seq_len, n_nodes, n_node_features)
-    assert y.shape == (n_samples, n_horizons)
+    assert y.shape == (n_samples, n_nodes, n_horizons)
 
     A_static = build_adjacency_matrix()
-    log.info("GNN sequences: X=%s y=%s", X.shape, y.shape)
-    return X, y, A_static
+    log.info("GNN sequences: X=%s y=%s | n_node_features=%d | n_nodes=%d",
+             X.shape, y.shape, n_node_features, n_nodes)
+    if return_index:
+        # Forecast-origin timestamp of each window: sample j ends at the last
+        # input row, combined.index[seq_len-1 + j]. Because `combined` had NaN rows
+        # dropped, these timestamps are NOT a contiguous slice of the input df —
+        # callers MUST use this to align predictions (a naive df.index slice misaligns
+        # whenever rows were dropped). Length matches n_samples.
+        sample_index = combined.index[seq_len - 1:]
+        assert len(sample_index) == n_samples
+        return X, y, A_static, scaler, sample_index
+    return X, y, A_static, scaler
 
 
 def train_gnn_lstm(
@@ -353,14 +423,15 @@ def train_gnn_lstm(
     patience: int = 15,
     lr: float = 1e-3,
     save_path: Optional[Path] = None,
+    scaler: Optional["StandardScaler"] = None,
 ) -> Tuple["torch.nn.Module", dict]:
     """Train the GNN-LSTM model with early stopping.
 
     Args:
         X_train: (n_train, seq_len, n_nodes, n_node_features).
-        y_train: (n_train, n_horizons) — log1p-transformed.
+        y_train: (n_train, n_nodes, n_horizons) — log1p-transformed per-node targets.
         X_val: Validation input.
-        y_val: Validation targets.
+        y_val: Validation targets (n_val, n_nodes, n_horizons).
         A_static: Static adjacency matrix (n_nodes, n_nodes).
         epochs: Max epochs.
         batch_size: Mini-batch size.
@@ -385,7 +456,7 @@ def train_gnn_lstm(
     seq_len = X_train.shape[1]
     n_nodes = X_train.shape[2]
     n_node_features = X_train.shape[3]
-    n_horizons = y_train.shape[1]
+    n_horizons = y_train.shape[2]   # y_train: (n, n_nodes, n_horizons)
 
     model = build_gnn_lstm_model(n_nodes, n_node_features, seq_len, n_horizons).to(device)
     A_t = torch.tensor(A_static, dtype=torch.float32).to(device)
@@ -396,7 +467,21 @@ def train_gnn_lstm(
     yv = torch.tensor(y_val, dtype=torch.float32).to(device)
 
     loader = DataLoader(TensorDataset(Xt, yt), batch_size=batch_size, shuffle=True)
-    criterion = nn.HuberLoss(delta=1.0)
+    # Per-horizon loss weighting: long horizons have larger errors and would
+    # otherwise dominate the summed loss, starving short-horizon accuracy. Weight
+    # each horizon by the inverse std of its (log1p) target, normalised to mean 1
+    # so the overall loss scale is unchanged.
+    criterion = nn.HuberLoss(delta=1.0, reduction="none")
+    # Per-horizon std over both sample and node dims → shape (n_horizons,).
+    horizon_std = torch.tensor(y_train.std(axis=(0, 1)), dtype=torch.float32, device=device)
+    horizon_std = torch.clamp(horizon_std, min=1e-6)
+    horizon_w = 1.0 / horizon_std
+    horizon_w = horizon_w / horizon_w.mean()          # mean-1 normalised, shape (n_horizons,)
+
+    def weighted_loss(pred, target):
+        # pred/target: (batch, n_nodes, n_horizons); horizon_w broadcasts over the last dim.
+        return (criterion(pred, target) * horizon_w).mean()
+
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, patience=5, factor=0.5, min_lr=1e-5
@@ -418,7 +503,7 @@ def train_gnn_lstm(
             xb, yb = xb.to(device), yb.to(device)
             optimizer.zero_grad()
             pred = model(xb, A_t)
-            loss = criterion(pred, yb)
+            loss = weighted_loss(pred, yb)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -427,7 +512,7 @@ def train_gnn_lstm(
 
         model.eval()
         with torch.no_grad():
-            val_loss = criterion(model(Xv, A_t), yv).item()
+            val_loss = weighted_loss(model(Xv, A_t), yv).item()
         scheduler.step(val_loss)
         history["train_loss"].append(epoch_loss)
         history["val_loss"].append(val_loss)
@@ -454,7 +539,9 @@ def train_gnn_lstm(
         ensure_dirs(Path(save_path).parent)
         torch.save({"model_state": best_state, "seq_len": seq_len,
                     "n_nodes": n_nodes, "n_node_features": n_node_features,
-                    "n_horizons": n_horizons, "A_static": A_static}, save_path)
+                    "n_horizons": n_horizons, "A_static": A_static,
+                    "all_stations": list(ALL_STATIONS_ORDERED),
+                    "scaler": scaler}, save_path)
         log.info("GNN-LSTM saved → %s", save_path)
     return model, history
 
@@ -474,10 +561,11 @@ def predict_gnn_lstm(
         batch_size: Inference batch size.
 
     Returns:
-        np.ndarray (n_samples, n_horizons) in µg/m³.
+        np.ndarray (n_samples, n_nodes, n_horizons) in µg/m³ — node *k* holds the
+        forecast for station ``all_stations[k]``. Slice ``preds[:, k, :]`` per station.
 
     Example:
-        >>> preds = predict_gnn_lstm(model, X_test, A_static)
+        >>> preds = predict_gnn_lstm(model, X_test, A_static)  # (n, n_nodes, 24)
     """
     import torch
     from torch.utils.data import DataLoader, TensorDataset
@@ -510,7 +598,8 @@ def train_stacking_ensemble(
         XGBoost, LightGBM, CatBoost, HistGradientBoosting [+ GNN-LSTM if provided]
 
     Level 1 meta-learner:
-        LightGBM trained on OOF predictions + meta features.
+        Ridge (scaled) trained on OOF predictions + meta features. Linear so it can
+        extrapolate to the long-horizon spikes a tree meta-learner would average down.
 
     All CV uses TimeSeriesSplit — no shuffling.
 
@@ -606,10 +695,19 @@ def train_stacking_ensemble(
     # Meta features: OOF predictions + time/weather signals (no future leak)
     meta_X = np.hstack([oof_matrix, X_train[meta_feature_cols].values.astype(np.float32)])
 
-    log.info("Training LightGBM meta-learner | meta_X=%s  n_meta_features=%d",
+    # Ridge meta-learner (linear): a tree meta-learner cannot extrapolate past its
+    # leaf averages, so it averages down the GNN's long-horizon spikes. A linear
+    # blend follows them. Inputs are scaled because ridge is scale-sensitive and the
+    # OOF prediction columns (~µg/m³) and meta features (e.g. hour_sin∈[-1,1]) differ
+    # by orders of magnitude.
+    from sklearn.linear_model import Ridge
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
+
+    log.info("Training Ridge meta-learner | meta_X=%s  n_meta_features=%d",
              meta_X.shape, meta_X.shape[1])
-    meta_learner = lgb.LGBMRegressor(n_estimators=200, learning_rate=0.05,
-                                      random_state=RANDOM_SEED, verbose=-1)
+    meta_learner = make_pipeline(StandardScaler(),
+                                 Ridge(alpha=1.0, random_state=RANDOM_SEED))
     meta_learner.fit(meta_X, y_arr)
     log.info("Meta-learner training complete.")
 

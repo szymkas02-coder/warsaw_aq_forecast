@@ -99,7 +99,7 @@ constants from this file — never define magic numbers inline.
 | `HYSPLIT_CATEGORICAL` | `["dir_48", "dir_24"]` | Encoded as one-hot |
 | `WHO_24H_PM25` | `15` µg/m³ | Plotted as reference line in all figures |
 | `RANDOM_SEED` | `42` | Passed to every stochastic operation |
-| `SEQ_LEN_LSTM` | `48` | CNN-LSTM lookback window |
+| `SEQ_LEN_LSTM` | `48` | CNN-LSTM lookback window (GNN-LSTM also uses 48, set as `SEQ_LEN_GNN` in `MS_C3_gnn_stacking.ipynb`) |
 | `N_OPTUNA_TRIALS` | `50` | Trials per Optuna study |
 | `CV_SPLITS` | `5` | `TimeSeriesSplit` folds everywhere |
 
@@ -345,7 +345,11 @@ Step 1 — Local pattern extraction (CNN)
 Step 2 — Temporal modelling (BiLSTM)
   BiLSTM(128 → 256 output) + Dropout(0.3)
   BiLSTM(256 → 128 output)
-  x[:, -1, :]    ← take the last timestep's hidden state
+
+Step 2b — Additive attention over all timesteps
+  scores  = W_attn @ lstm_out               shape (batch, seq_len//2, 1)
+  weights = softmax(scores, dim=time)
+  context = sum(weights * lstm_out, dim=1)  shape (batch, 128)
 
 Step 3 — Prediction head
   Linear(128 → 64) + ReLU
@@ -364,10 +368,18 @@ The lookback window is fixed and fully available at prediction time — there
 is no causal constraint within the window itself. BiLSTM can use context
 from both directions within the 48-hour history.
 
+**Why attention over LSTM outputs?**
+The most predictive timestep is not always the last one. Attention learns a
+softmax weighting over all timesteps (same design as `GnnLstmModel`) instead of
+discarding everything but the final hidden state.
+
 ### Training: `train_cnn_lstm`
 
 - **Loss**: `HuberLoss(delta=1.0)` — behaves like MAE for errors >1 log-unit
   and like MSE for smaller errors. Robust to the rare extreme PM2.5 spikes.
+  Applied with `reduction="none"` and a **per-horizon weight** (inverse std of each
+  horizon's log1p target, normalised to mean 1) so long horizons — whose errors are
+  larger — do not dominate the gradient and starve short-horizon accuracy.
 - **Optimiser**: Adam, `lr=1e-3`, no weight decay.
 - **LR schedule**: `ReduceLROnPlateau(patience=5, factor=0.5)` — halves the
   learning rate if validation loss stagnates for 5 epochs.
@@ -425,52 +437,79 @@ matrix; dynamic adjacency can be applied per-timestep in advanced extensions.
 
 ### 9b. GNN Sequence Dataset: `build_gnn_sequence_dataset`
 
-Each node (station) has 10 features per timestep:
+Each node (station) has 35 features per timestep, matching the *information set* the
+tree models receive (so the C2/C3 comparison is fair). Features are StandardScaled
+(fit on train, reused on test, saved in the model checkpoint).
 
 ```
-[pm25_lag1, pm25_lag24, TEMP, WIND_SPEED, blh, HUMIDITY,
- hour_sin, hour_cos, month_sin, month_cos]
+station-specific (per node's own series):
+  [pm25_lag1, pm25_lag24, rolling_mean_24h, rolling_max_24h, trend_24h]
+
+shared, broadcast to every node:
+  [TEMP, WIND_SPEED, PRESS_SEA, HUMIDITY, DEW_POINT, RAIN_6H, SUNSHINE, blh,   # MET_COLS (8)
+   lon_48, lat_48, lon_24, lat_24, dist_48_straight, dist_48_total, ratio_48,  # HYSPLIT numeric (10)
+   dist_24_straight, dist_24_total, ratio_24,
+   dir_48_*, dir_24_*,                                                          # HYSPLIT dir one-hots (8)
+   hour_sin, hour_cos, month_sin, month_cos]                                    # cyclical time (4)
 ```
 
-Shared meteorological features (TEMP, WIND_SPEED, blh, HUMIDITY) are the same
-for all nodes — only the PM2.5 lags are station-specific.
+The HYSPLIT **direction one-hots** (`dir_48_*`, `dir_24_*`) are the same dummy columns
+the tree/stacking models receive via `build_feature_matrix`/`encode_hysplit`, so the
+GNN's information set now matches theirs.
+
+**Neighbor PM2.5 is intentionally NOT a feature column** — the graph convolution
+aggregates it across nodes, so flat neighbor-lags would double-count. This is the one
+deliberate difference from the trees' flat feature set: the GNN gets spatial
+information through the graph topology instead of as columns.
+
+*(Earlier versions used only 10 unscaled per-node features and no HYSPLIT; later the
+numeric HYSPLIT was added, and now the direction one-hots too — see git history /
+RERUN_NEEDED.md.)*
+
+**Single shared multi-output model.** Every station is both a node and a readout target,
+so the per-node targets give `y` shape `(n_samples, n_nodes, 24)`. One GNN is trained for
+all stations at once (the LSTM/attention/head weights are shared across nodes); a station's
+forecast is read out from its node. This replaces the previous design that trained one GNN
+per target station (node 0 = target).
 
 ```
-X shape:  (n_samples, seq_len=24, n_nodes=7, n_node_features=10)
-y shape:  (n_samples, 24)   — log1p PM2.5 at the target node, h=1..24
+X shape:  (n_samples, seq_len=48, n_nodes=7, n_node_features=35)
+y shape:  (n_samples, n_nodes=7, 24)   — log1p PM2.5, each node's own future, h=1..24
 ```
 
 ### 9c. GNN-LSTM Model: `GnnLstmModel` (built inside `build_gnn_lstm_model`)
 
 ```
-Input: (batch, seq_len=24, n_nodes=7, n_node_features=10)
+Input: (batch, seq_len=48, n_nodes=7, n_node_features=35)
 
-For each timestep t ∈ {0..23}:
-  x_t: (batch, 7, 10)
+For each timestep t ∈ {0..47}:
+  x_t: (batch, 7, 35)
 
   Graph convolution:
     h_i = ReLU( W_self @ x_i  +  A @ (W_neigh @ X) )
     BatchNorm over (batch × n_nodes, gnn_hidden=64)
 
-  Select target node (node 0):
-    h_target_t: (batch, 64)
+  Keep ALL node embeddings:
+    h_t: (batch, 7, 64)
 
-Stack over time → target_seq: (batch, 24, 64)
+Stack over time → node_seq: (batch, 48, 7, 64)
+
+Fold nodes into batch (weights shared across nodes) → (batch·7, 48, 64)
 
 BiLSTM(64 → 256 output):
-  lstm_out: (batch, 24, 256)
+  lstm_out: (batch·7, 48, 256)
   Dropout(0.3)
 
 Additive attention:
-  scores = tanh( W_attn @ lstm_out )        shape (batch, 24, 1)
+  scores = W_attn @ lstm_out                shape (batch·7, 48, 1)
   weights = softmax(scores, dim=time)
-  context = sum(weights * lstm_out, dim=1)  shape (batch, 256)
+  context = sum(weights * lstm_out, dim=1)  shape (batch·7, 256)
 
 Prediction head:
   Linear(256 → 64) + ReLU
   Linear(64 → 24)
 
-Output: (batch, 24)  — log1p PM2.5
+Reshape → Output: (batch, n_nodes=7, 24)  — log1p PM2.5, one forecast per station node
 ```
 
 **Why graph convolution?**
@@ -480,7 +519,7 @@ wind direction. One graph conv layer aggregates all 7 stations into a spatial
 embedding before the temporal LSTM processes the sequence.
 
 **Why attention over LSTM outputs?**
-For a 24-hour lookback, the most predictive timestep is not always the last one.
+For a 48-hour lookback, the most predictive timestep is not always the last one.
 Attention lets the model learn that 6–12 hours ago might carry more signal for
 certain horizons than the most recent observation.
 
@@ -498,7 +537,13 @@ certain horizons than the most recent observation.
 
 **Level 1 — Meta-learner:**
 
-LightGBM trained on `[oof_preds_1..5, hour_sin, hour_cos, month_sin, month_cos, blh, pm25_now]`.
+Ridge regression (wrapped in `StandardScaler` via `make_pipeline`, `alpha=1.0`)
+trained on `[oof_preds_1..5, hour_sin, hour_cos, month_sin, month_cos, blh, pm25_now]`.
+A linear meta-learner is used deliberately: it can extrapolate to long-horizon
+pollution spikes, whereas a tree meta-learner (the earlier LightGBM) is bounded by
+its leaf averages and tends to average the GNN's long-horizon signal back down.
+Scaling is required because the OOF columns (~µg/m³) and the cyclical/meta features
+(∈ [-1, 1]) differ by orders of magnitude.
 
 **Out-of-fold (OOF) generation with `TimeSeriesSplit`:**
 
@@ -530,7 +575,7 @@ root to `sys.path` with `sys.path.insert(0, '..')` at the top of each notebook.
 | `MS_00b_cross_station_EDA.ipynb` | raw CSV | `outputs/{station}/figures/` (gitignored) |
 | `MS_C1_xgboost.ipynb` | raw CSV | `outputs/{station}/models/xgb_pfxf_h*.pkl`, `hgb_pfxf_h*.pkl` (gitignored), `C1_metrics.csv` |
 | `MS_C2_cnn_lstm.ipynb` | raw CSV | `outputs/{station}/models/cnn_lstm_pfxf_model.pt` (gitignored), `C2_metrics.csv` |
-| `MS_C3_gnn_stacking.ipynb` | raw CSV + C1 models | `gnn_lstm_pfxf_model.pt`, `meta_learner_pfxf_h*.pkl` (gitignored), `C3_metrics.csv`, `comparison_table_all.csv` |
+| `MS_C3_gnn_stacking.ipynb` | raw CSV + C1 models | `gnn_lstm_shared_pfxf_model.pt` (one shared GNN for all stations), `meta_learner_pfx_h*.pkl` (gitignored), per-station `C3_metrics.csv`, `comparison_table_all.csv` |
 | `MS_04_comparison.ipynb` | `C1/C2/C3_metrics.csv` per station | cross-station comparison figures (gitignored) |
 | `MS_05_shap.ipynb` | C1 models | SHAP summary and dependence plots (gitignored) |
 | `MS_06_smog_episodes.ipynb` | C1 + C3 models, raw CSV | episode overlay figures (gitignored) |
@@ -649,13 +694,13 @@ df["pm25_future"] = df[TARGET].shift(-24)   # never do this
 | `y` (tabular) | `(n_rows,)` | `build_feature_matrix` |
 | `X_seq` (CNN-LSTM) | `(n_samples, 48, n_features)` | `build_sequence_dataset` |
 | `y_seq` (CNN-LSTM) | `(n_samples, 24)` — log1p | `build_sequence_dataset` |
-| `X_gnn` | `(n_samples, 24, 7, 10)` | `build_gnn_sequence_dataset` |
-| `y_gnn` | `(n_samples, 24)` — log1p | `build_gnn_sequence_dataset` |
+| `X_gnn` | `(n_samples, 48, 7, 27)` | `build_gnn_sequence_dataset` |
+| `y_gnn` | `(n_samples, n_nodes=7, 24)` — log1p, per-node | `build_gnn_sequence_dataset` |
 | `A_static` | `(7, 7)` — row-normalised | `build_adjacency_matrix` |
 | CNN-LSTM output | `(batch, 24)` — log1p | `CnnLstmModel.forward` |
-| GNN-LSTM output | `(batch, 24)` — log1p | `GnnLstmModel.forward` |
+| GNN-LSTM output | `(batch, n_nodes=7, 24)` — log1p | `GnnLstmModel.forward` |
 | `predict_cnn_lstm` return | `(n_samples, 24)` — µg/m³ | expm1 applied inside |
-| `predict_gnn_lstm` return | `(n_samples, 24)` — µg/m³ | expm1 applied inside |
+| `predict_gnn_lstm` return | `(n_samples, n_nodes=7, 24)` — µg/m³ | expm1 inside; slice `[:, k, :]` for station k |
 | `oof_matrix` | `(n_train, n_base_models)` | `train_stacking_ensemble` |
 | `meta_X` | `(n_train, n_base + n_meta_feats)` | `train_stacking_ensemble` |
 | `predict_all_horizons` | `(n_test, 24)` — µg/m³ | `baseline_gbm.py` |

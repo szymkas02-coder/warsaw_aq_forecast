@@ -45,7 +45,7 @@ This project develops and compares **three machine learning architectures** for 
 
 All architectures use **physically meaningful inputs** — Okęcie synoptic meteorological observations, ERA5 Boundary Layer Height, and HYSPLIT 24/48-hour back-trajectory cluster directions — to ensure the model learns causally valid relationships rather than spurious correlations.
 
-> **Key results:** C3 GNN-LSTM (base) achieves the best h=24 performance with MAE=3.86 µg/m³ and R²=0.56 — a **29% MAE reduction** vs. the persistence naive baseline (5.41 µg/m³). C3 Stacking matches C1 HGB at h=24 (MAE=4.33) while C1 HGB dominates at h≤3 with MAE=1.13 µg/m³ at h=1 and significantly lower inference cost.
+> **Key results (target station MzWarChrosci):** at h=24 the deep models lead — C2 CNN-LSTM MAE=3.72 µg/m³, R²=0.60 (a **31% MAE reduction** vs. the persistence baseline of 5.41 µg/m³), with C3 GNN-LSTM close behind (3.93, R²=0.57). Averaged across all 7 stations, the single shared C3 GNN-LSTM is the best long-horizon model (h=24 MAE=4.54, R²=0.56). At short horizons the tree models dominate (C1 MAE≈1.13 µg/m³ at h=1) at far lower inference cost. The C3 stacking ensemble leads at h=1 (1.27) but currently degrades past h≈5 due to a non-true-OOF GNN base column (§3.3).
 
 ---
 
@@ -107,13 +107,39 @@ The architecture follows the general family demonstrated effective in air qualit
 
 This architecture represents the state of the art as established by recent literature (Liao et al., 2023; Tian et al., 2024; Mandal & Thakur, 2023).
 
-**Graph Neural Network component:** The seven Warsaw monitoring stations are modeled as nodes in a spatial graph. A static adjacency matrix is constructed from inverse Euclidean distance (Gaussian kernel); dynamic edge weights are modulated by HYSPLIT trajectory directions to strengthen connections from upwind stations and weaken irrelevant downwind ones. Graph convolution aggregates spatial information across this topology at each timestep, allowing the model to "see" pollution spreading from upstream stations before it arrives at the target.
+**Graph Neural Network component:** The seven Warsaw monitoring stations are modeled as nodes in a spatial graph. A static adjacency matrix is constructed from inverse great-circle distance (Gaussian kernel). Graph convolution aggregates spatial information across this topology at each timestep, allowing the model to "see" pollution spreading from upstream stations before it arrives at the target. A trajectory-informed *dynamic* adjacency — which would up-weight upwind stations by HYSPLIT trajectory direction — is implemented (`dynamic_adjacency()`) as a documented extension but is **not** wired into the trained model; the results below use the static adjacency.
 
-**LSTM component:** The sequence of spatial representations produced by the GNN is fed to a Bidirectional LSTM with attention, capturing the temporal dynamics of pollution advection and accumulation.
+**Single shared multi-output model:** every station is both a node and a readout target. The GNN convolution feeds all node embeddings — with weights shared across nodes — into the LSTM/attention/head, so one training produces a forecast for *every* station simultaneously (output shape `(n_samples, n_nodes, n_horizons)`); a station's forecast is read out from its node. Each node carries its own PM2.5 autoregressive features while meteorology, BLH, and HYSPLIT (numeric **and** direction one-hots) are broadcast across nodes — the same information set the tree models receive. This replaces an earlier design that trained one GNN per target station.
 
-**Stacking ensemble:** Following Tian et al. (2024), the GNN-LSTM output is combined with four tree-based base models (XGBoost, LightGBM, CatBoost, HGB) through a LightGBM meta-learner. Out-of-fold predictions are generated using `TimeSeriesSplit` to train the meta-learner without look-ahead leakage. This stacking framework consistently outperforms any individual base model by exploiting the complementary strengths: tree models excel at tabular meteorological feature interactions; the GNN-LSTM excels at spatial propagation and temporal sequence learning.
+**LSTM component:** The sequence of spatial representations produced by the GNN is fed to a Bidirectional LSTM with attention (weights shared across station nodes), capturing the temporal dynamics of pollution advection and accumulation.
 
-The DM-STGNN architecture (Liao et al., 2023), which uses HYSPLIT to define dynamic multi-granularity graph edges and achieved 13% RMSE and 14% MAE reduction vs. classical GNNs, serves as the primary architectural inspiration.
+**Stacking ensemble:** Following Tian et al. (2024), the GNN-LSTM output is combined with four tree-based base models (XGBoost, LightGBM, CatBoost, HGB) through a Ridge meta-learner (scaled; a linear blend so long-horizon spikes are not averaged down as a tree meta-learner would). Out-of-fold predictions are generated using `TimeSeriesSplit` to train the meta-learner without look-ahead leakage. The stacking framework aims to exploit complementary strengths — tree models excel at tabular meteorological feature interactions; the GNN-LSTM excels at spatial propagation and temporal sequence learning.
+
+**Why the ensemble *should* win — and why it doesn't yet.** By construction the stacking
+head should be the best model at every horizon: it has the trees' short-horizon `pm25_now`
+skill *and* the deep models' long-horizon spatial-temporal skill on tap, with a per-horizon
+linear blend to weight them. Empirically it leads at h=1 (target-station MAE 1.27) but
+*inverts* past h≈5, finishing worse than its own GNN base model at h=24 (MAE 5.44 vs the
+GNN's 3.93) with a positive bias drift (MBE → +2.8 µg/m³). The cause is specific: of the five
+base columns the meta-learner sees, four are honest out-of-fold (`TimeSeriesSplit`) but the
+**GNN column is a full-train prediction** — produced on data the GNN trained on, so it is
+artificially good and biased at fit time. A linear Ridge cannot route around one leaky,
+over-trusted column the way a tree could, so it over-weights it and the long-horizon blend
+drifts high. The remedy — a *true* GNN OOF (retrain the GNN per fold, ≈5× cost) — is a
+compute problem, not a design flaw, and the single-shared-GNN refactor below already made it
+~7× cheaper per training (one 5-fold pass now covers all stations). With honest OOF the
+ensemble should reclaim the long-horizon lead while keeping its short-horizon edge. This is
+documented as the open next step rather than papered over; see `MODEL_ANALYSIS.md`.
+
+**Implementation note — single shared multi-output GNN.** The GNN was originally trained once
+per target station (7 trainings, each reading out a designated target node). It is now a
+single shared model: all stations are nodes *and* readout targets, with the LSTM/attention/head
+weights shared across nodes, so one (~7× cheaper) training emits every station's forecast.
+It also receives the HYSPLIT trajectory-direction one-hots (previously only the numeric HYSPLIT
+columns were used), matching the trees' information set. The published deep-model metrics
+reflect these post-refactor models and therefore differ from earlier project drafts.
+
+The DM-STGNN architecture (Liao et al., 2023), which uses HYSPLIT to define dynamic multi-granularity graph edges and achieved 13% RMSE and 14% MAE reduction vs. classical GNNs, serves as the primary architectural inspiration. This project implements the spatial-graph + temporal-LSTM backbone with a static distance-based adjacency; the HYSPLIT-driven *dynamic* edge weighting is the natural next extension (scaffolded in `dynamic_adjacency()`, not yet enabled).
 
 ---
 
@@ -269,20 +295,45 @@ MS_00_EDA → MS_00b_cross_station_EDA → MS_C1_xgboost → MS_C2_cnn_lstm
 
 All results are on the held-out 2024 test set (8 784 hourly observations). The final model series (C-series) uses `weather_mode="perfect_forecast_full"` — meteorological inputs are aligned to the predicted moment, simulating perfect NWP output. This is the standard literature setup; see Section 5 for details.
 
+**Target station — MzWarChrosci** (2024 test set):
+
 | Model | h=1h MAE | h=6h MAE | h=12h MAE | h=24h MAE | h=24h R² |
 |---|---|---|---|---|---|
 | Persistence (naive) | — | — | — | 5.41 µg/m³ | 0.10 |
-| C1: XGBoost | 1.14 | 3.17 | 3.97 | 4.39 µg/m³ | 0.45 |
-| C1: HGB | **1.13** | **3.07** | **3.90** | 4.33 µg/m³ | 0.47 |
-| C2: CNN-LSTM | 2.67 | 4.28 | 4.66 | 4.38 µg/m³ | 0.37 |
-| C3: GNN-LSTM (base) | 2.68 | 3.74 | 4.35 | 3.86 µg/m³ | 0.56 |
-| C3: Stacking (final) | 1.16 | 3.12 | 3.97 | **4.33 µg/m³** | **0.47** |
+| C1: XGBoost | **1.13** | **3.10** | **3.92** | 4.29 µg/m³ | 0.48 |
+| C1: HGB | **1.13** | 3.11 | 3.93 | 4.33 µg/m³ | 0.47 |
+| C2: CNN-LSTM | 2.65 | 3.70 | 3.72 | **3.72 µg/m³** | **0.60** |
+| C3: GNN-LSTM (base) | 2.80 | 3.97 | 4.11 | 3.93 µg/m³ | 0.57 |
+| C3: Stacking (final) | 1.27 | 3.99 | 5.07 | 5.44 µg/m³ | 0.33 |
 
-> MAE in µg/m³. **Bold** = best per column. C3 GNN-LSTM alone achieves the best R²=0.56 at h=24.
+**Cross-station mean** (all 7 stations; the C3 GNN is a single shared model forecasting every station):
+
+| Model | h=1h MAE | h=6h MAE | h=12h MAE | h=24h MAE | h=24h R² |
+|---|---|---|---|---|---|
+| C1: XGBoost | 1.43 | 3.58 | 4.35 | 4.65 µg/m³ | 0.51 |
+| C1: HGB | 1.45 | 3.63 | 4.39 | 4.68 µg/m³ | 0.51 |
+| C2: CNN-LSTM | 3.22 | 4.42 | 4.55 | 4.69 µg/m³ | 0.48 |
+| C3: GNN-LSTM (base) | 3.37 | 4.61 | 4.74 | **4.54 µg/m³** | **0.56** |
+| C3: Stacking (final) | 1.63 | 4.82 | 5.90 | 6.05 µg/m³ | 0.39 |
+
+> MAE in µg/m³. **Bold** = best per column. Short horizons go to the tree models; long
+> horizons to the deep models — C2 CNN-LSTM at the target station (h=24 R²=0.60), and the
+> shared C3 GNN-LSTM on the cross-station average (h=24 R²=0.56). The stacking ensemble
+> currently underperforms its own base models past h≈5 (MBE → +2.8 at h=24): the GNN column
+> it consumes is a full-train, not true-OOF, prediction — see §3.3 and `MODEL_ANALYSIS.md`.
+> The published deep-model numbers reflect the post-refactor models (attention/validation
+> fixes for C2; single shared multi-output model for C3), so they differ from earlier drafts.
 
 ### Smog episode skill
 
-Top-5 worst PM2.5 episodes in 2024 were analysed separately (see `MS_06_smog_episodes.ipynb`). All models systematically underestimate peak concentrations, a known limitation of MAE-optimised regressors. C3 GNN-LSTM shows the best relative skill during advective episodes (southerly trajectories from Silesia).
+The top-5 worst PM2.5 episodes of 2024 are analysed in `MS_06_smog_episodes.ipynb`, overlaying
+all three architectures at a single horizon (h=12). The tree (C1 HGB) and CNN-LSTM (C2) models
+track the episode peaks well — within a few µg/m³ on most episodes (e.g. Episode 1, observed
+peak 68.9: HGB 69.3, CNN-LSTM 57.6) — while the **C3 GNN-LSTM systematically under-shoots the
+sharpest peaks** (negative episode MBE), the smoothing expected from a spatial-aggregation
+model. All models still under-estimate the single highest spike to some degree, the known
+limitation of MAE-optimised regressors. At h=12 with perfect-forecast meteorology, all three
+catch the Episode 1 alert onset ≥6 h early.
 
 ---
 

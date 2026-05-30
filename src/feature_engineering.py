@@ -306,7 +306,8 @@ def build_sequence_dataset(
     scaler_X: Optional[StandardScaler] = None,
     fit_scaler: bool = False,
     weather_mode: str = WEATHER_MODE_CURRENT,
-) -> Tuple[np.ndarray, np.ndarray, List[str], Optional[StandardScaler]]:
+    return_index: bool = False,
+):
     """Build sliding-window 3-D arrays for sequence models (CNN-LSTM, GNN).
 
     Each sample contains seq_len timesteps of features and a target vector of
@@ -397,4 +398,11 @@ def build_sequence_dataset(
 
     log.info("Sequence dataset: X=%s, y=%s, features=%d",
              X_seq.shape, y_seq.shape, len(feature_cols))
+    if return_index:
+        # Forecast-origin timestamp per window: combined.index[seq_len-1 + j].
+        # `combined` had NaN rows dropped, so these are NOT a contiguous df slice —
+        # callers must use this to align predictions back to real timestamps.
+        sample_index = combined.index[seq_len - 1:]
+        assert len(sample_index) == n_samples
+        return X_seq, y_seq, feature_cols, scaler_X, sample_index
     return X_seq, y_seq, feature_cols, scaler_X

@@ -140,7 +140,19 @@ def train_cnn_lstm(
     train_ds = TensorDataset(Xt, yt)
     loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
 
-    criterion = nn.HuberLoss(delta=1.0)
+    # Per-horizon loss weighting: long horizons have larger errors and would
+    # otherwise dominate the summed loss, starving short-horizon accuracy. Weight
+    # each horizon by the inverse std of its (log1p) target, normalised to mean 1
+    # so the overall loss scale is unchanged.
+    criterion = nn.HuberLoss(delta=1.0, reduction="none")
+    horizon_std = torch.tensor(y_train.std(axis=0), dtype=torch.float32, device=device)
+    horizon_std = torch.clamp(horizon_std, min=1e-6)
+    horizon_w = 1.0 / horizon_std
+    horizon_w = horizon_w / horizon_w.mean()          # mean-1 normalised, shape (n_horizons,)
+
+    def weighted_loss(pred, target):
+        return (criterion(pred, target) * horizon_w).mean()
+
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, patience=5, factor=0.5, min_lr=1e-5
@@ -164,7 +176,7 @@ def train_cnn_lstm(
             xb, yb = xb.to(device), yb.to(device)
             optimizer.zero_grad()
             pred = model(xb)
-            loss = criterion(pred, yb)
+            loss = weighted_loss(pred, yb)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -173,7 +185,7 @@ def train_cnn_lstm(
 
         model.eval()
         with torch.no_grad():
-            val_loss = criterion(model(Xv), yv).item()
+            val_loss = weighted_loss(model(Xv), yv).item()
 
         scheduler.step(val_loss)
         history["train_loss"].append(epoch_loss)
